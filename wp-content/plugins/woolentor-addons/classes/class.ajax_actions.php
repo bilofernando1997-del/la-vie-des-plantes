@@ -1,0 +1,593 @@
+<?php  
+if ( ! defined( 'ABSPATH' ) ) exit; // Exit if accessed directly
+
+class Woolentor_Ajax_Action{
+
+	/**
+	 * [$instance]
+	 * @var null
+	 */
+	private static $instance = null;
+
+	/**
+	 * [instance]
+	 * @return [Woolentor_Ajax_Action]
+	 */
+    public static function instance(){
+        if( is_null( self::$instance ) ){
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    /**
+     * [__construct]
+     */
+    function __construct(){
+
+        // For Ajax Add to cart
+		add_action( 'wp_ajax_woolentor_insert_to_cart', [ $this, 'insert_to_cart' ] );
+		add_action( 'wp_ajax_nopriv_woolentor_insert_to_cart', [ $this, 'insert_to_cart' ] );
+
+        // For Single Product ajax add to cart
+        add_action( 'wp_ajax_woolentor_add_to_cart_single_product', [ $this, 'add_to_cart_from_single_product' ] );
+		add_action( 'wp_ajax_nopriv_woolentor_add_to_cart_single_product', [ $this, 'add_to_cart_from_single_product' ] );
+
+        // Sugest Price Elementor addon
+        add_action( 'wp_ajax_woolentor_suggest_price_action', [$this, 'suggest_price'] );
+        add_action( 'wp_ajax_nopriv_woolentor_suggest_price_action', [$this, 'suggest_price'] );
+
+        // Load more products for product grid
+        add_action( 'wp_ajax_woolentor_load_more_products', [$this, 'load_more_products'] );
+        add_action( 'wp_ajax_nopriv_woolentor_load_more_products', [$this, 'load_more_products'] );
+
+        // Add every product in a Shop the Look look, in one request
+        add_action( 'wp_ajax_woolentor_add_look_to_cart', [ $this, 'add_look_to_cart' ] );
+        add_action( 'wp_ajax_nopriv_woolentor_add_look_to_cart', [ $this, 'add_look_to_cart' ] );
+
+        add_action( 'wp_ajax_woolentor_add_bundle_to_cart', [ $this, 'add_bundle_to_cart' ] );
+        add_action( 'wp_ajax_nopriv_woolentor_add_bundle_to_cart', [ $this, 'add_bundle_to_cart' ] );
+
+        // Custom select control AJAX search
+        add_action( 'wp_ajax_woolentor_select_search', [$this, 'select_search'] );
+        add_action( 'wp_ajax_woolentor_select_get_titles', [$this, 'select_get_titles'] );
+
+    }
+
+    /**
+     * [insert_to_cart] Insert add to cart
+     * @return [JSON]
+     */
+    public function insert_to_cart(){
+
+        if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], 'woolentor_psa_nonce' ) ){
+            $errormessage = array(
+                'message'  => __('Nonce Varification Faild !','woolentor')
+            );
+            wp_send_json_error( $errormessage );
+        }
+
+        // phpcs:disable WordPress.Security.NonceVerification.Missing
+        if ( ! isset( $_POST['product_id'] ) ) {
+            return;
+        }
+
+        $product_id         = apply_filters( 'woocommerce_add_to_cart_product_id', absint( $_POST['product_id'] ) );
+        $quantity           = empty( $_POST['quantity'] ) ? 1 : wc_stock_amount( wp_unslash( $_POST['quantity'] ) );
+        $variation_id       = !empty( $_POST['variation_id'] ) ? absint( $_POST['variation_id'] ) : 0;
+        $variations         = !empty( $_POST['variations'] ) ? array_map( 'sanitize_text_field', $_POST['variations'] ) : array();
+        $passed_validation  = apply_filters( 'woocommerce_add_to_cart_validation', true, $product_id, $quantity, $variation_id, $variations );
+        $product_status     = get_post_status( $product_id );
+
+        if ( $passed_validation && \WC()->cart->add_to_cart( $product_id, $quantity, $variation_id, $variations ) && 'publish' === $product_status ) {
+            do_action( 'woocommerce_ajax_added_to_cart', $product_id );
+            if ( 'yes' === get_option('woocommerce_cart_redirect_after_add') ) {
+                wc_add_to_cart_message( array( $product_id => $quantity ), true );
+            }
+            \WC_AJAX::get_refreshed_fragments();
+        } else {
+            $data = array(
+                'error' => true,
+                'product_url' => apply_filters('woocommerce_cart_redirect_after_error', get_permalink( $product_id ), $product_id ),
+            );
+            wp_send_json_error( $data );
+        }
+        wp_send_json_success();
+        
+    }
+
+    /**
+     * [add_look_to_cart] Add every product in a Shop the Look look, in one request.
+     *
+     * Deliberately not three calls to insert_to_cart(). Each of those ends in
+     * WC_AJAX::get_refreshed_fragments(), so adding a three-item look would race three fragment
+     * responses against each other and show a cart count that is briefly, visibly wrong. This adds
+     * the whole list in one pass and refreshes the fragments once at the end.
+     *
+     * A product that cannot be added without a choice — variable, external, or out of stock — is
+     * skipped rather than guessed at, and the response says how many actually went in. Silently
+     * dropping one would take a shopper's money for a set they did not get.
+     *
+     * @return void
+     */
+    public function add_look_to_cart() {
+
+        if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['nonce'] ) ), 'woolentor_psa_nonce' ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'Nonce Varification Faild !', 'woolentor' ) ] );
+        }
+
+        // phpcs:disable WordPress.Security.NonceVerification.Missing
+        $ids = isset( $_POST['product_ids'] ) ? array_map( 'absint', (array) wp_unslash( $_POST['product_ids'] ) ) : [];
+        $ids = array_values( array_filter( array_unique( $ids ) ) );
+        // phpcs:enable WordPress.Security.NonceVerification.Missing
+
+        if ( empty( $ids ) || ! function_exists( 'wc_get_product' ) || ! \WC()->cart ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'Nothing to add.', 'woolentor' ) ] );
+        }
+
+        $added   = 0;
+        $skipped = 0;
+
+        foreach ( $ids as $id ) {
+            $product = wc_get_product( $id );
+
+            if ( ! $product || 'publish' !== get_post_status( $id )
+                || ! $product->is_purchasable() || ! $product->is_in_stock()
+                || $product->is_type( 'variable' ) || $product->is_type( 'external' ) ) {
+                $skipped++;
+                continue;
+            }
+
+            $product_id = apply_filters( 'woocommerce_add_to_cart_product_id', $id );
+
+            if ( ! apply_filters( 'woocommerce_add_to_cart_validation', true, $product_id, 1, 0, [] ) ) {
+                $skipped++;
+                continue;
+            }
+
+            if ( \WC()->cart->add_to_cart( $product_id, 1 ) ) {
+                do_action( 'woocommerce_ajax_added_to_cart', $product_id );
+                $added++;
+            } else {
+                $skipped++;
+            }
+        }
+
+        if ( ! $added ) {
+            wp_send_json_error( [
+                'message' => esc_html__( 'None of these products could be added on their own.', 'woolentor' ),
+                'skipped' => $skipped,
+            ] );
+        }
+
+        // One refresh for the whole look, after every add — this is the reason the endpoint exists.
+        //
+        // Built here rather than through WC_AJAX::get_refreshed_fragments(), which ends in
+        // wp_send_json() and so never returns: buffering its output would swallow the response but
+        // still terminate the request, and this endpoint's own added/skipped counts would never be
+        // sent. These are the same two lines that function assembles before it sends.
+        ob_start();
+        woocommerce_mini_cart();
+        $mini_cart = ob_get_clean();
+
+        $fragments = apply_filters( 'woocommerce_add_to_cart_fragments', [
+            'div.widget_shopping_cart_content' => '<div class="widget_shopping_cart_content">' . $mini_cart . '</div>',
+        ] );
+
+        wp_send_json_success( [
+            'added'     => $added,
+            'skipped'   => $skipped,
+            'fragments' => $fragments,
+            'cart_hash' => \WC()->cart->get_cart_hash(),
+        ] );
+    }
+
+    /**
+     * [add_bundle_to_cart] Add every product in a Product Bundle, in one request.
+     *
+     * Like add_look_to_cart() this exists so a set of products produces **one** cart-fragment
+     * refresh rather than one per product racing the others. It differs in two ways: each item
+     * carries its own quantity, and a bundle may name a real WooCommerce coupon to apply once the
+     * items are in.
+     *
+     * **What is skipped here must match what the widget declined to display.** Both sides call
+     * woolentor_bundle_item_is_addable(), which lives in includes/helper-function.php precisely
+     * because that file is loaded on every request — the widget class is not. It is registered on
+     * `elementor/widgets/register`, a hook admin-ajax.php never fires, so an earlier version that
+     * asked the widget class skipped every single item here.
+     *
+     * @return void
+     */
+    public function add_bundle_to_cart() {
+
+        if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['nonce'] ) ), 'woolentor_psa_nonce' ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'Nonce Varification Faild !', 'woolentor' ) ] );
+        }
+
+        // phpcs:disable WordPress.Security.NonceVerification.Missing
+        $raw    = isset( $_POST['items'] ) ? (array) wp_unslash( $_POST['items'] ) : [];
+        $coupon = isset( $_POST['coupon'] ) ? wc_format_coupon_code( sanitize_text_field( wp_unslash( $_POST['coupon'] ) ) ) : '';
+        // phpcs:enable WordPress.Security.NonceVerification.Missing
+
+        $wanted = [];
+
+        foreach ( $raw as $row ) {
+            $id  = absint( $row['id'] ?? 0 );
+            $qty = isset( $row['qty'] ) ? wc_stock_amount( $row['qty'] ) : 1;
+
+            if ( ! $id || $qty <= 0 ) {
+                continue;
+            }
+
+            // The same product listed twice in one bundle is one line with a bigger quantity.
+            $wanted[ $id ] = ( $wanted[ $id ] ?? 0 ) + $qty;
+        }
+
+        if ( empty( $wanted ) || ! function_exists( 'wc_get_product' ) || ! \WC()->cart ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'Nothing to add.', 'woolentor' ) ] );
+        }
+
+        $added   = 0;
+        $skipped = 0;
+        $ids     = [];
+
+        foreach ( $wanted as $id => $qty ) {
+            $product = wc_get_product( $id );
+
+            if ( ! woolentor_bundle_item_is_addable( $product, $id ) ) {
+                $skipped++;
+                continue;
+            }
+
+            $product_id = apply_filters( 'woocommerce_add_to_cart_product_id', $id );
+
+            if ( ! apply_filters( 'woocommerce_add_to_cart_validation', true, $product_id, $qty, 0, [] ) ) {
+                $skipped++;
+                continue;
+            }
+
+            if ( \WC()->cart->add_to_cart( $product_id, $qty ) ) {
+                do_action( 'woocommerce_ajax_added_to_cart', $product_id );
+                $added++;
+                $ids[] = $product_id;
+            } else {
+                $skipped++;
+            }
+        }
+
+        if ( ! $added ) {
+            wp_send_json_error( [
+                'message' => esc_html__( 'None of these products could be added on their own.', 'woolentor' ),
+                'skipped' => $skipped,
+            ] );
+        }
+
+        // The coupon is the merchant's own, configured in WooCommerce. Nothing here invents a
+        // discount: if the code is wrong or its own restrictions reject it, the cart simply keeps
+        // the prices the widget already showed, and the response says what happened.
+        $coupon_state = '';
+
+        if ( '' !== $coupon ) {
+            if ( \WC()->cart->has_discount( $coupon ) ) {
+                $coupon_state = 'already';
+            } else {
+                $applied      = \WC()->cart->apply_coupon( $coupon );
+                $coupon_state = $applied ? 'applied' : 'failed';
+
+                // apply_coupon() reports its refusal through the notice store. Left there it would
+                // surface on whatever page the shopper loads next, detached from this action.
+                if ( ! $applied ) {
+                    wc_clear_notices();
+                }
+            }
+        }
+
+        // One refresh for the whole bundle, after every add — the reason this endpoint exists.
+        // Built by hand rather than through WC_AJAX::get_refreshed_fragments(), which ends in
+        // wp_send_json() and never returns, so this endpoint's own counts would never be sent.
+        ob_start();
+        woocommerce_mini_cart();
+        $mini_cart = ob_get_clean();
+
+        $fragments = apply_filters( 'woocommerce_add_to_cart_fragments', [
+            'div.widget_shopping_cart_content' => '<div class="widget_shopping_cart_content">' . $mini_cart . '</div>',
+        ] );
+
+        wp_send_json_success( [
+            'added'     => $added,
+            'skipped'   => $skipped,
+            'ids'       => $ids,
+            'coupon'    => $coupon_state,
+            'fragments' => $fragments,
+            'cart_hash' => \WC()->cart->get_cart_hash(),
+        ] );
+    }
+
+    /**
+     * Ajax Actin For Single Product Add to Cart
+     */
+    public function add_to_cart_from_single_product() {
+
+        add_action( 'wp_loaded', [ 'WC_Form_Handler', 'add_to_cart_action' ], 20 );
+
+        $wc_notice = wc_get_notices();
+        if ( is_callable( [ 'WC_AJAX', 'get_refreshed_fragments' ] ) && ! isset( $wc_notice['error'] ) ) {
+            \WC_AJAX::get_refreshed_fragments();
+        }
+
+        wp_send_json_success();
+    }
+
+    /**
+     * Email Send for suggest_price
+     * @return [void]
+     */
+    public function suggest_price(){
+        $response = [
+            'error' => false,
+        ];
+
+        // Verify nonce
+        if ( !isset( $_POST['woolentor_suggest_price_nonce_field'] ) || !wp_verify_nonce( $_POST['woolentor_suggest_price_nonce_field'], 'woolentor_suggest_price_nonce' ) ){
+            $response['error'] = true;
+            $response['message'] = esc_html__('Sorry, your nonce verification failed.','woolentor');
+            wp_send_json_error( $response );
+        }
+
+        // Get and validate form token (this links to server-stored recipient email)
+        $form_token = isset( $_POST['form_token'] ) ? sanitize_text_field( $_POST['form_token'] ) : '';
+        if ( empty( $form_token ) ) {
+            $response['error'] = true;
+            $response['message'] = esc_html__('Invalid form submission.','woolentor');
+            wp_send_json_error( $response );
+        }
+
+        // Retrieve recipient email from server-side storage (NOT from user input)
+        $stored_data = get_transient( 'woolentor_suggest_price_' . $form_token );
+        if ( false === $stored_data || !is_array( $stored_data ) ) {
+            $response['error'] = true;
+            $response['message'] = esc_html__('Form session expired. Please refresh and try again.','woolentor');
+            wp_send_json_error( $response );
+        }
+
+        // Get recipient from server-stored data (secure - not user controlled)
+        $allowed_recipient = isset( $stored_data['recipient_email'] ) ? sanitize_email( $stored_data['recipient_email'] ) : '';
+        $stored_product_id = isset( $stored_data['product_id'] ) ? absint( $stored_data['product_id'] ) : 0;
+
+        // Validate stored recipient
+        if ( empty( $allowed_recipient ) || ! is_email( $allowed_recipient ) ) {
+            // Fallback to admin email if stored email is invalid
+            $allowed_recipient = get_option( 'admin_email' );
+        }
+
+        // Get and validate product
+        $product_id = absint( $_POST['product_id'] ?? 0 );
+
+        // Verify product_id matches stored product_id (prevents manipulation)
+        if ( $product_id !== $stored_product_id ) {
+            $response['error'] = true;
+            $response['message'] = esc_html__('Invalid product.','woolentor');
+            wp_send_json_error( $response );
+        }
+
+        $product = wc_get_product( $product_id );
+        if ( ! $product ) {
+            $response['error'] = true;
+            $response['message'] = esc_html__('Invalid product.','woolentor');
+            wp_send_json_error( $response );
+        }
+
+        // Get user messages from widget settings (stored server-side)
+        $msg_success = isset( $stored_data['msg_success'] ) ? sanitize_text_field( $stored_data['msg_success'] ) : esc_html__('Thank you for contacting us.','woolentor');
+        $msg_error = isset( $stored_data['msg_error'] ) ? sanitize_text_field( $stored_data['msg_error'] ) : esc_html__('Something went wrong. Please try again.','woolentor');
+
+        // Validate sender's name
+        $name = isset( $_POST['wlname'] ) ? sanitize_text_field( $_POST['wlname'] ) : '';
+        if ( empty( $name ) ) {
+            $response['error'] = true;
+            $response['message'] = esc_html__('Name is required.','woolentor');
+            wp_send_json_error( $response );
+        }
+        // Limit name length
+        if ( strlen( $name ) > 100 ) {
+            $name = substr( $name, 0, 100 );
+        }
+
+        // Validate sender's email (sanitize to prevent CRLF injection)
+        $email = isset( $_POST['wlemail'] ) ? sanitize_email( trim( $_POST['wlemail'] ) ) : '';
+        if ( empty( $email ) ) {
+            $response['error'] = true;
+            $response['message'] = esc_html__('Email is required.','woolentor');
+            wp_send_json_error( $response );
+        }
+        if ( ! is_email( $email ) ) {
+            $response['error'] = true;
+            $response['message'] = esc_html__('Invalid email address.','woolentor');
+            wp_send_json_error( $response );
+        }
+
+        // Validate and sanitize message
+        $message = isset( $_POST['wlmessage'] ) ? wp_strip_all_tags( $_POST['wlmessage'] ) : '';
+        if ( empty( $message ) ) {
+            $response['error'] = true;
+            $response['message'] = esc_html__('Message is required.','woolentor');
+            wp_send_json_error( $response );
+        }
+        // Limit message length to prevent abuse
+        if ( strlen( $message ) > 1000 ) {
+            $message = substr( $message, 0, 1000 );
+        }
+
+        // Build subject from actual product name (not user input)
+        $subject = sprintf(
+            /* translators: %s: Product name */
+            esc_html__( 'Suggest Price For - %s', 'woolentor' ),
+            $product->get_name()
+        );
+
+        // Build email body with sender info
+        $email_body = sprintf(
+            /* translators: 1: Sender name, 2: Sender email, 3: Product name, 4: Message */
+            esc_html__( "Name: %1\$s\nEmail: %2\$s\nProduct: %3\$s\n\nMessage:\n%4\$s", 'woolentor' ),
+            $name,
+            $email,
+            $product->get_name(),
+            $message
+        );
+
+        // Set headers with Reply-To (sanitized email prevents header injection)
+        $headers = [
+            'Reply-To: ' . $name . ' <' . $email . '>'
+        ];
+
+        // Send email to the server-stored recipient (NOT user-controlled)
+        $mail_sent_status = wp_mail( $allowed_recipient, $subject, $email_body, $headers );
+
+        // Delete the old transient after use (one-time use token)
+        delete_transient( 'woolentor_suggest_price_' . $form_token );
+
+        if( $mail_sent_status ) {
+            $response['error'] = false;
+            $response['message'] = esc_html( $msg_success );
+
+            // Generate a new token for subsequent submissions (without page refresh)
+            $new_token = wp_generate_password( 32, false, false );
+
+            // Store the same data with new token
+            $new_transient_data = [
+                'recipient_email' => $allowed_recipient,
+                'product_id'      => $product_id,
+                'msg_success'     => $msg_success,
+                'msg_error'       => $msg_error,
+            ];
+            set_transient( 'woolentor_suggest_price_' . $new_token, $new_transient_data, HOUR_IN_SECONDS );
+
+            // Return new token to client for form update
+            $response['new_token'] = $new_token;
+
+        } else {
+            $response['error'] = true;
+            $response['message'] = esc_html( $msg_error );
+
+            // On error, regenerate token as well (old one is already deleted)
+            $new_token = wp_generate_password( 32, false, false );
+            $new_transient_data = [
+                'recipient_email' => $allowed_recipient,
+                'product_id'      => $product_id,
+                'msg_success'     => $msg_success,
+                'msg_error'       => $msg_error,
+            ];
+            set_transient( 'woolentor_suggest_price_' . $new_token, $new_transient_data, HOUR_IN_SECONDS );
+            $response['new_token'] = $new_token;
+        }
+
+        wp_send_json_success( $response );
+    }
+
+    /**
+     * Ajax Callback for Load more and Infinite scrool
+     *
+     * @return void
+     */
+    public function load_more_products() {
+
+        // Load dependencies
+        if ( ! class_exists( 'WooLentor_Product_Grid_Base' ) ) {
+            require_once WOOLENTOR_ADDONS_PL_PATH . 'includes/addons/product-grid/base/class.product-grid-base.php';
+        }
+
+        $product_grid_base = new WooLentor_Product_Grid_Base();
+
+        // Verify nonce
+        if ( ! isset( $_POST['nonce'] ) || ! (wp_verify_nonce( $_POST['nonce'], 'woolentor_psa_nonce' ) || wp_verify_nonce( $_POST['nonce'], 'woolentorblock-nonce' )) ) {
+            wp_send_json_error( array( 'message' => __( 'Security check failed', 'woolentor' ) ) );
+        }
+
+        // Get settings and page number
+        $page = isset( $_POST['page'] ) ? absint( $_POST['page'] ) : 2;
+
+        $setting_data = isset( $_POST['settings'] ) ? (is_string($_POST['settings']) ? stripslashes( $_POST['settings'] ) : '' ) : '';
+        $setting_data = json_decode( $setting_data, true );
+        $view_layout = isset( $_POST['viewlayout'] ) ? $_POST['viewlayout'] : '';
+
+        if(!empty($view_layout)){
+            $setting_data['layout'] = $view_layout;
+        }
+
+        $setting_data['paged'] = $page;
+
+        ob_start();
+        $product_grid_base->render_items( $setting_data, true );
+        $html = ob_get_clean();
+
+        wp_send_json_success( array(
+            'html' => $html,
+            'current_page' => $page
+        ));
+
+    }
+
+    /**
+     * AJAX search for woolentor-select control
+     */
+    public function select_search() {
+        if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], 'woolentor_select_control' ) ) {
+            wp_send_json_error( [ 'message' => __( 'Nonce verification failed.', 'woolentor' ) ] );
+        }
+
+        $search_term = isset( $_POST['s'] ) ? sanitize_text_field( $_POST['s'] ) : '';
+        $post_type   = isset( $_POST['post_type'] ) ? sanitize_text_field( $_POST['post_type'] ) : 'product';
+
+        if ( empty( $search_term ) ) {
+            wp_send_json_success( [ 'results' => [] ] );
+        }
+
+        $query = new \WP_Query( [
+            's'              => $search_term,
+            'post_type'      => $post_type,
+            'post_status'    => 'publish',
+            'posts_per_page' => 20,
+            'fields'         => 'ids',
+        ] );
+
+        $results = [];
+        if ( $query->have_posts() ) {
+            foreach ( $query->posts as $post_id ) {
+                $results[] = [
+                    'id'   => $post_id,
+                    'text' => get_the_title( $post_id ),
+                ];
+            }
+        }
+
+        wp_send_json_success( [ 'results' => $results ] );
+    }
+
+    /**
+     * AJAX get titles for woolentor-select control (saved selections)
+     */
+    public function select_get_titles() {
+        if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], 'woolentor_select_control' ) ) {
+            wp_send_json_error( [ 'message' => __( 'Nonce verification failed.', 'woolentor' ) ] );
+        }
+
+        $ids       = isset( $_POST['ids'] ) ? array_map( 'absint', (array) $_POST['ids'] ) : [];
+        $post_type = isset( $_POST['post_type'] ) ? sanitize_text_field( $_POST['post_type'] ) : 'product';
+
+        $results = [];
+        foreach ( $ids as $id ) {
+            $post = get_post( $id );
+            if ( $post && $post->post_type === $post_type && $post->post_status === 'publish' ) {
+                $results[] = [
+                    'id'   => $id,
+                    'text' => $post->post_title,
+                ];
+            }
+        }
+
+        wp_send_json_success( [ 'results' => $results ] );
+    }
+
+}
+
+Woolentor_Ajax_Action::instance();
